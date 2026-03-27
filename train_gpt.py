@@ -104,7 +104,7 @@ class Hyperparameters:
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.99))
 
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
