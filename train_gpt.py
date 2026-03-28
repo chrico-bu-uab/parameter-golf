@@ -1296,8 +1296,12 @@ def main() -> None:
         est_8x_step_ms = (local_step_ms / grad_accum_steps) * 1.1
         est_8x_iters = int(600_000 / est_8x_step_ms)
         args.iterations = est_8x_iters
+        # Cap warmdown at 60% of estimated iterations so LR starts at full
+        max_warmdown = int(est_8x_iters * 0.6)
+        if args.warmdown_iters > max_warmdown:
+            args.warmdown_iters = max_warmdown
         max_wallclock_ms = None  # step-based warmdown
-        log0(f"simulate_8xh100: local_step={local_step_ms:.0f}ms est_8x_step={est_8x_step_ms:.0f}ms iterations={est_8x_iters}")
+        log0(f"simulate_8xh100: local_step={local_step_ms:.0f}ms est_8x_step={est_8x_step_ms:.0f}ms iterations={est_8x_iters} warmdown={args.warmdown_iters}")
         # Reset model and optimizers after calibration
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
