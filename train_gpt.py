@@ -36,15 +36,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default run:
-# - 11 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 3x MLP expansion
-# - SmearGate + BigramHash(4096,128) at embedding layer
-# - XSA on last 4 layers, Partial RoPE (16/64), LN Scale, LeakyReLU²
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - int6+zstd quantization, EMA, sliding window eval (stride=64)
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
-
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -1241,6 +1232,9 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
+    # SIMULATE_8XH100: after warmup, estimate how many steps 8xH100 would complete
+    # in 10 min, then run that many iterations with step-based warmdown (no wallclock cap).
+    simulate_8x = bool(int(os.environ.get("SIMULATE_8XH100", "0")))
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
@@ -1280,6 +1274,35 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    # Auto-calibrate: estimate 8xH100 step count from warmup timing
+    if simulate_8x and args.warmup_steps >= 5:
+        torch.cuda.synchronize()
+        cal_t0 = time.perf_counter()
+        cal_steps = 5
+        for _ in range(cal_steps):
+            zero_grad_all()
+            for micro_step in range(grad_accum_steps):
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    cal_loss = model(x, y)
+                (cal_loss * grad_scale).backward()
+            for opt in optimizers:
+                opt.step()
+        torch.cuda.synchronize()
+        local_step_ms = 1000.0 * (time.perf_counter() - cal_t0) / cal_steps
+        # On 8xH100: grad_accum_steps=1 (vs our 8), plus DDP comm overhead ~10%
+        est_8x_step_ms = (local_step_ms / grad_accum_steps) * 1.1
+        est_8x_iters = int(600_000 / est_8x_step_ms)
+        args.iterations = est_8x_iters
+        max_wallclock_ms = None  # step-based warmdown
+        log0(f"simulate_8xh100: local_step={local_step_ms:.0f}ms est_8x_step={est_8x_step_ms:.0f}ms iterations={est_8x_iters}")
+        # Reset model and optimizers after calibration
+        base_model.load_state_dict(initial_model_state, strict=True)
+        for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
+            opt.load_state_dict(state)
+        zero_grad_all()
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
