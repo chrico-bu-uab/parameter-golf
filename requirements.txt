@@ -9,3 +9,4 @@ datasets
 tiktoken
 sentencepiece
 huggingface_hub
+zstandard
