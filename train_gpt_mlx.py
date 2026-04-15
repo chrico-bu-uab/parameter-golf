@@ -111,6 +111,7 @@ class Hyperparameters:
     bigram_dim: int = int(os.environ.get("BIGRAM_DIM", 128))
 
     qat_enabled: bool = bool(int(os.environ.get("QAT_ENABLED", "0")))
+    skip_serialization: bool = bool(int(os.environ.get("SKIP_SERIALIZATION", "0")))
 
     swa_enabled: bool = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac: float = float(os.environ.get("SWA_START_FRAC", 0.5))
@@ -149,7 +150,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale,output_scale,output_scales",
     ).split(",")
     if pattern
 )
@@ -372,7 +373,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
+    # Leaky-relu^2: allows a small negative gradient, empirically beats relu^2 in this setup.
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
         hidden = int(dim * mlp_mult)
@@ -380,7 +381,7 @@ class MLP(nn.Module):
         self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
+        x = nn.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x * x)
 
 
@@ -750,13 +751,20 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.arr
 
 
 def quantize_int6_per_row(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
+    """GPTQ-lite: search over clip percentiles to minimize reconstruction MSE."""
     f32 = _np_float32(arr)
     if f32.ndim == 2:
-        row_max = np.abs(f32).max(axis=1)
-        scale = np.maximum(row_max / 31.0, 1e-12).astype(np.float16)
-        scale = np.maximum(scale, np.finfo(np.float16).tiny)
-        q = np.clip(np.round(f32 / scale.astype(np.float32)[:, None]), -32, 31).astype(np.int8)
-        return np.ascontiguousarray(q), np.ascontiguousarray(scale)
+        best_q, best_s, best_err = None, None, float("inf")
+        for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
+            row_clip = np.quantile(np.abs(f32), pct, axis=1) if pct < 1.0 else np.abs(f32).max(axis=1)
+            s = np.maximum(row_clip / 31.0, 1e-12).astype(np.float16)
+            s = np.maximum(s, np.finfo(np.float16).tiny)
+            q = np.clip(np.round(f32 / s.astype(np.float32)[:, None]), -32, 31).astype(np.int8)
+            recon = q.astype(np.float32) * s.astype(np.float32)[:, None]
+            err = float(np.mean((f32 - recon) ** 2))
+            if err < best_err:
+                best_q, best_s, best_err = q, s, err
+        return np.ascontiguousarray(best_q), np.ascontiguousarray(best_s)
     amax = float(np.abs(f32).max()) if f32.size else 0.0
     scale = np.array(max(amax / 31.0, 1e-12), dtype=np.float16)
     q = np.clip(np.round(f32 / float(scale)), -32, 31).astype(np.int8)
@@ -1259,7 +1267,8 @@ def main() -> None:
     step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        run_val = args.val_loss_every >= 0 and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0))
+        if run_val:
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
             # Validation always scans the same fixed full validation split.
             val_loss, val_bpb = eval_val(
@@ -1337,6 +1346,10 @@ def main() -> None:
     # ==============================================================================
     # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
     # ==============================================================================
+    if args.skip_serialization:
+        log("skip_serialization:True — skipping artifact save and roundtrip eval")
+        return
+
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     flat_state = {k: v for k, v in tree_flatten(model.state)}
     mx.savez(str(out_path), **flat_state)
